@@ -1,4 +1,4 @@
-module github.com/ctfer.io/chall-manager
+module github.com/ctfer-io/chall-manager
 
 go 1.25.4
 
