@@ -22,6 +22,7 @@ import (
 	yamlv2 "github.com/pulumi/pulumi-kubernetes/sdk/v4/go/kubernetes/yaml/v2"
 	"github.com/pulumi/pulumi/sdk/v3/go/pulumi"
 	"go.uber.org/multierr"
+	appsv1 "k8s.io/api/apps/v1"
 	cv1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 )
@@ -488,6 +489,53 @@ func (kmp *Kompose) provision(ctx *pulumi.Context, in KomposeArgsOutput, opts ..
 		},
 	}))
 
+	// Copy image pull secrets from the source namespace to the challenge namespace
+	// Extract secret names from the YAML by running kompose conversion
+	secretNames := []string{}
+	wg := sync.WaitGroup{}
+	wg.Add(1)
+	in.YAML().ApplyT(func(yaml string) error {
+		defer wg.Done()
+		_, objs, err := kompose(yaml)
+		if err != nil {
+			return err
+		}
+		secretNames = extractImagePullSecrets(objs)
+		return nil
+	})
+	wg.Wait()
+
+	// Copy each secret from the source namespace to the target namespace
+	// We use GetSecret to read the existing secret and then create a copy in the new namespace
+	for _, secretName := range secretNames {
+		secretNameLocal := secretName // capture loop variable
+		
+		// Build the source secret ID as namespace/name
+		sourceSecretID := pulumi.All(in.ImagePullSecretsNamespace(), pulumi.String(secretNameLocal)).ApplyT(func(args []interface{}) pulumi.ID {
+			return pulumi.ID(fmt.Sprintf("%s/%s", args[0].(string), args[1].(string)))
+		}).(pulumi.IDOutput)
+		
+		// Get the secret from the source namespace using GetSecret
+		sourceSecret, serr := corev1.GetSecret(ctx, fmt.Sprintf("source-secret-%s", secretNameLocal), sourceSecretID, nil, opts...)
+		if serr != nil {
+			// If secret doesn't exist in source namespace, continue - Kubernetes will fail later with clear error
+			continue
+		}
+
+		// Create a copy of the secret in the target namespace
+		_, err = corev1.NewSecret(ctx, fmt.Sprintf("secret-%s", secretNameLocal), &corev1.SecretArgs{
+			Metadata: metav1.ObjectMetaArgs{
+				Name:      pulumi.String(secretNameLocal),
+				Namespace: kmp.ns.Metadata.Name().Elem(),
+			},
+			Data: sourceSecret.Data,
+			Type: sourceSecret.Type,
+		}, opts...)
+		if err != nil {
+			return
+		}
+	}
+
 	// Generate Kubernetes resources
 	objwg := sync.WaitGroup{}
 	objwg.Add(1)
@@ -941,6 +989,32 @@ func kompose(yaml string) (string, []runtime.Object, error) {
 	return string(man), objs, nil
 }
 
+// extractImagePullSecrets extracts unique image pull secret names from Kubernetes Deployment objects.
+func extractImagePullSecrets(objs []runtime.Object) []string {
+	secretNames := map[string]struct{}{}
+	
+	for _, obj := range objs {
+		// Check if the object is a Deployment
+		if dep, ok := obj.(*appsv1.Deployment); ok {
+			// Extract imagePullSecrets from the pod template spec
+			if dep.Spec.Template.Spec.ImagePullSecrets != nil {
+				for _, secret := range dep.Spec.Template.Spec.ImagePullSecrets {
+					if secret.Name != "" {
+						secretNames[secret.Name] = struct{}{}
+					}
+				}
+			}
+		}
+	}
+	
+	// Convert map to slice
+	result := make([]string, 0, len(secretNames))
+	for name := range secretNames {
+		result = append(result, name)
+	}
+	return result
+}
+
 type KomposeArgsRaw struct {
 	Identity string  `pulumi:"identity"`
 	Label    *string `pulumi:"label"`
@@ -954,6 +1028,10 @@ type KomposeArgsRaw struct {
 	FromCIDR         string            `pulumi:"fromCIDR"`
 	IngressNamespace string            `pulumi:"ingressNamespace"`
 	IngressLabels    map[string]string `pulumi:"ingressLabels"`
+
+	// ImagePullSecretsNamespace is the namespace from which to copy image pull secrets.
+	// If not specified, defaults to "default".
+	ImagePullSecretsNamespace string `pulumi:"imagePullSecretsNamespace"`
 }
 
 type KomposeArgsInput interface {
@@ -982,6 +1060,10 @@ type KomposeArgs struct {
 	FromCIDR         pulumi.StringInput    `pulumi:"fromCIDR"`
 	IngressNamespace pulumi.StringInput    `pulumi:"ingressNamespace"`
 	IngressLabels    pulumi.StringMapInput `pulumi:"ingressLabels"`
+
+	// ImagePullSecretsNamespace is the namespace from which to copy image pull secrets.
+	// If not specified, defaults to "default".
+	ImagePullSecretsNamespace pulumi.StringInput `pulumi:"imagePullSecretsNamespace"`
 }
 
 func (KomposeArgs) ElementType() reflect.Type {
@@ -1051,6 +1133,15 @@ func (o KomposeArgsOutput) IngressLabels() pulumi.StringMapOutput {
 	return o.ApplyT(func(args KomposeArgsRaw) map[string]string {
 		return args.IngressLabels
 	}).(pulumi.StringMapOutput)
+}
+
+func (o KomposeArgsOutput) ImagePullSecretsNamespace() pulumi.StringOutput {
+	return o.ApplyT(func(args KomposeArgsRaw) string {
+		if args.ImagePullSecretsNamespace == "" {
+			return "default"
+		}
+		return args.ImagePullSecretsNamespace
+	}).(pulumi.StringOutput)
 }
 
 func init() {
