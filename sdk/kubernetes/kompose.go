@@ -501,7 +501,7 @@ func (kmp *Kompose) provision(ctx *pulumi.Context, in KomposeArgsOutput, opts ..
 	var komposeErr error
 	in.ApplyT(func(args KomposeArgsRaw) error {
 		defer wg.Done()
-		_, objs, err := kompose(args.YAML)
+		_, objs, err := kompose(args.YAML, args.Identity)
 		if err != nil {
 			komposeErr = err
 			return err
@@ -562,9 +562,9 @@ func (kmp *Kompose) provision(ctx *pulumi.Context, in KomposeArgsOutput, opts ..
 	objwg := sync.WaitGroup{}
 	objwg.Add(1)
 	kmp.cg, err = yamlv2.NewConfigGroup(ctx, "kompose", &yamlv2.ConfigGroupArgs{
-		Yaml: pulumi.All(in.YAML(), in.Identity()).ApplyT(func(all []any) (man string) {
+		Yaml: in.ApplyT(func(in KomposeArgsRaw) (man string) {
 			//man, _, _ = kompose(in.YAML, in.Identity)
-			man, _, _ = kompose(all[0].(string), all[1].(string))
+			man, _, _ = kompose(in.YAML, in.Identity)
 
 			//  _, objs, err := kompose(yaml)
 			//  if err != nil {
