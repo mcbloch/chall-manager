@@ -536,8 +536,8 @@ func (kmp *Kompose) provision(ctx *pulumi.Context, in KomposeArgsOutput, opts ..
 		// Get the secret from the source namespace using GetSecret
 		sourceSecret, serr := corev1.GetSecret(ctx, fmt.Sprintf("source-secret-%s", secretNameLocal), sourceSecretID, nil, opts...)
 		if serr != nil {
-			// Log a warning but continue - the deployment will fail with a clear Kubernetes error if the secret is actually needed
-			log.Printf("Warning: Could not get image pull secret '%s' from source namespace. If this secret is required, the deployment will fail.", secretNameLocal)
+			// If the secret doesn't exist, skip copying it.
+			// The Kubernetes deployment will fail with a clear error if the secret is actually needed.
 			continue
 		}
 
