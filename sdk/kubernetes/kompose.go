@@ -403,21 +403,21 @@ func (kmp *Kompose) provision(ctx *pulumi.Context, in KomposeArgsOutput, opts ..
 
 	// Transform resources to match expected configuration
 	opts = append(opts, pulumi.Transforms([]pulumi.ResourceTransform{
-		// Inject namespace
-		func(_ context.Context, args *pulumi.ResourceTransformArgs) *pulumi.ResourceTransformResult {
-			switch args.Type {
-			// Inject namespace on the fly; with the fix, applying the namespace to all created resources, further below, this is probably redundant
-			case "kubernetes:apps/v1:Deployment", "kubernetes:core/v1:Service":
-				args.Props["metadata"].(pulumi.Map)["namespace"] = in.Identity()
-				return &pulumi.ResourceTransformResult{
-					Props: args.Props,
-					Opts:  args.Opts,
-				}
-
-			default:
-				return nil
-			}
-		},
+		//// Inject namespace
+		//func(_ context.Context, args *pulumi.ResourceTransformArgs) *pulumi.ResourceTransformResult {
+		//	switch args.Type {
+		//	// Inject namespace on the fly; with the fix, applying the namespace to all created resources, further below, this is probably redundant
+		//	case "kubernetes:apps/v1:Deployment", "kubernetes:core/v1:Service":
+		//		args.Props["metadata"].(pulumi.Map)["namespace"] = in.Identity()
+		//		return &pulumi.ResourceTransformResult{
+		//			Props: args.Props,
+		//			Opts:  args.Opts,
+		//		}
+		//
+		//	default:
+		//		return nil
+		//	}
+		//},
 		// Make service NodePorts whenever required
 		func(_ context.Context, args *pulumi.ResourceTransformArgs) *pulumi.ResourceTransformResult {
 			if args.Type == "kubernetes:core/v1:Service" {
