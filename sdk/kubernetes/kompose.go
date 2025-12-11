@@ -490,14 +490,17 @@ func (kmp *Kompose) provision(ctx *pulumi.Context, in KomposeArgsOutput, opts ..
 	}))
 
 	// Copy image pull secrets from the source namespace to the challenge namespace
-	// Extract secret names from the YAML by running kompose conversion
-	secretNames := []string{}
+	// Extract secret names from the YAML by running kompose conversion synchronously
+	var secretNames []string
+	// We need to extract the secret names synchronously from the in parameter
 	wg := sync.WaitGroup{}
 	wg.Add(1)
-	in.YAML().ApplyT(func(yaml string) error {
+	var komposeErr error
+	in.ApplyT(func(args KomposeArgsRaw) error {
 		defer wg.Done()
-		_, objs, err := kompose(yaml)
+		_, objs, err := kompose(args.YAML)
 		if err != nil {
+			komposeErr = err
 			return err
 		}
 		secretNames = extractImagePullSecrets(objs)
@@ -505,20 +508,36 @@ func (kmp *Kompose) provision(ctx *pulumi.Context, in KomposeArgsOutput, opts ..
 	})
 	wg.Wait()
 
+	if komposeErr != nil {
+		return komposeErr
+	}
+
 	// Copy each secret from the source namespace to the target namespace
 	// We use GetSecret to read the existing secret and then create a copy in the new namespace
 	for _, secretName := range secretNames {
 		secretNameLocal := secretName // capture loop variable
-		
-		// Build the source secret ID as namespace/name
-		sourceSecretID := pulumi.All(in.ImagePullSecretsNamespace(), pulumi.String(secretNameLocal)).ApplyT(func(args []interface{}) pulumi.ID {
-			return pulumi.ID(fmt.Sprintf("%s/%s", args[0].(string), args[1].(string)))
+
+		// Build the source secret ID as namespace/name with safe type handling
+		sourceSecretID := pulumi.All(in.ImagePullSecretsNamespace(), pulumi.String(secretNameLocal)).ApplyT(func(args []interface{}) (pulumi.ID, error) {
+			if len(args) != 2 {
+				return "", fmt.Errorf("expected 2 arguments, got %d", len(args))
+			}
+			namespace, ok := args[0].(string)
+			if !ok {
+				return "", fmt.Errorf("expected namespace to be string, got %T", args[0])
+			}
+			name, ok := args[1].(string)
+			if !ok {
+				return "", fmt.Errorf("expected secret name to be string, got %T", args[1])
+			}
+			return pulumi.ID(fmt.Sprintf("%s/%s", namespace, name)), nil
 		}).(pulumi.IDOutput)
-		
+
 		// Get the secret from the source namespace using GetSecret
 		sourceSecret, serr := corev1.GetSecret(ctx, fmt.Sprintf("source-secret-%s", secretNameLocal), sourceSecretID, nil, opts...)
 		if serr != nil {
-			// If secret doesn't exist in source namespace, continue - Kubernetes will fail later with clear error
+			// Log a warning but continue - the deployment will fail with a clear Kubernetes error if the secret is actually needed
+			log.Printf("Warning: Could not get image pull secret '%s' from source namespace. If this secret is required, the deployment will fail.", secretNameLocal)
 			continue
 		}
 
@@ -992,7 +1011,7 @@ func kompose(yaml string) (string, []runtime.Object, error) {
 // extractImagePullSecrets extracts unique image pull secret names from Kubernetes Deployment objects.
 func extractImagePullSecrets(objs []runtime.Object) []string {
 	secretNames := map[string]struct{}{}
-	
+
 	for _, obj := range objs {
 		// Check if the object is a Deployment
 		if dep, ok := obj.(*appsv1.Deployment); ok {
@@ -1006,7 +1025,7 @@ func extractImagePullSecrets(objs []runtime.Object) []string {
 			}
 		}
 	}
-	
+
 	// Convert map to slice
 	result := make([]string, 0, len(secretNames))
 	for name := range secretNames {
