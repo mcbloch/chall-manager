@@ -567,13 +567,14 @@ func (kmp *Kompose) provision(ctx *pulumi.Context, in KomposeArgsOutput, opts ..
 	kmp.cg, err = yamlv2.NewConfigGroup(ctx, "kompose", &yamlv2.ConfigGroupArgs{
 		Yaml: in.ApplyT(func(in KomposeArgsRaw) (man string) {
 			//man, _, _ = kompose(in.YAML, in.Identity)
-			man, ojbs, err = kompose(in.YAML, in.Identity)
-			if err != nil {
-				panic(err)
-			}
 
 			// An alternative is to pass namespace to Kompose directly,
 			// then kompose is also creating a namespace which we need to remove
+			//
+			// man, ojbs, err = kompose(in.YAML, in.Identity)
+			//	if err != nil {
+			//		panic(err)
+			//	}
 			//
 			//// Re-serialize objects to YAML
 			//s := json.NewYAMLSerializer(
@@ -590,6 +591,8 @@ func (kmp *Kompose) provision(ctx *pulumi.Context, in KomposeArgsOutput, opts ..
 			//		log.Printf("kompose: warning: cannot access metadata of object: %v", err)
 			//		continue
 			//	}
+			//  // GetKind is not a valid method of the accessor, need to use TypeMeta
+			//  // But I don't know how to at the moment
 			//	if accessor.GetKind() == "Namespace" {
 			//		continue
 			//	}
@@ -618,10 +621,11 @@ func (kmp *Kompose) provision(ctx *pulumi.Context, in KomposeArgsOutput, opts ..
 				}
 				// Skip cluster-scoped resources
 				if acc.GetNamespace() == "" {
-					in.Identity.ApplyT(func(ns string) error {
-						acc.SetNamespace(ns)
-						return nil
-					})
+					acc.SetNamespace(in.Identity)
+					//in.Identity.ApplyT(func(ns string) error {
+					//	acc.SetNamespace(ns)
+					//	return nil
+					//})
 				}
 			}
 
