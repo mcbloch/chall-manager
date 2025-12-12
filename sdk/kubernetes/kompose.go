@@ -3,14 +3,12 @@ package kubernetes
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"k8s.io/apimachinery/pkg/api/meta"
+	"k8s.io/apimachinery/pkg/runtime/serializer/json"
 
-	//"k8s.io/apimachinery/pkg/api/meta"
-	//"k8s.io/apimachinery/pkg/runtime/serializer/json"
 	"log"
 	"maps"
 	"os"
