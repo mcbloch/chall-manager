@@ -146,3 +146,5 @@ require (
 )
 
 replace github.com/ctfer-io/chall-manager => github.com/mcbloch/chall-manager v0.0.0-20251209230134-7dbd71c039cb
+
+replace github.com/ctfer-io/chall-manager/sdk => github.com/mcbloch/chall-manager/sdk v0.0.0-20251212130546-34477c5d1a60

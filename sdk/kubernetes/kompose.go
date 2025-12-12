@@ -572,9 +572,58 @@ func (kmp *Kompose) provision(ctx *pulumi.Context, in KomposeArgsOutput, opts ..
 				panic(err)
 			}
 
-			// An alternative would be to pass namespace to Kompose directly,
-			// but then it will also create the namespace which we don't want
-			// so then you should remove this afterwards.
+			// An alternative is to pass namespace to Kompose directly,
+			// then kompose is also creating a namespace which we need to remove
+			//
+			//// Re-serialize objects to YAML
+			//s := json.NewYAMLSerializer(
+			//	json.DefaultMetaFactory,
+			//	nil,
+			//	nil,
+			//)
+			//
+			//var buf bytes.Buffer
+			//for _, obj := range objs {
+			//	// Check if obj is a namespace, if so, remove it
+			//	accessor, err := meta.Accessor(obj)
+			//	if err != nil {
+			//		log.Printf("kompose: warning: cannot access metadata of object: %v", err)
+			//		continue
+			//	}
+			//	if accessor.GetKind() == "Namespace" {
+			//		continue
+			//	}
+			//
+			//	if err := s.Encode(obj.(runtime.Object), &buf); err != nil {
+			//		panic(err)
+			//	}
+			//	buf.WriteString("\n---\n")
+			//}
+			//
+			//man = buf.String()
+
+			// Below is an alternative method where we inject the namespace on the objects
+			// If this method is used, then you don't want to pass the namespace to Kompose directly
+
+			_, objs, err := kompose(in.YAML, in.Identity)
+			if err != nil {
+				panic(err)
+			}
+
+			// Inject namespace directly into Kompose objects
+			for _, obj := range objs {
+				acc, err := meta.Accessor(obj)
+				if err != nil {
+					continue
+				}
+				// Skip cluster-scoped resources
+				if acc.GetNamespace() == "" {
+					in.Identity.ApplyT(func(ns string) error {
+						acc.SetNamespace(ns)
+						return nil
+					})
+				}
+			}
 
 			// Re-serialize objects to YAML
 			s := json.NewYAMLSerializer(
@@ -585,16 +634,6 @@ func (kmp *Kompose) provision(ctx *pulumi.Context, in KomposeArgsOutput, opts ..
 
 			var buf bytes.Buffer
 			for _, obj := range objs {
-				// Check if obj is a namespace, if so, remove it
-				accessor, err := meta.Accessor(obj)
-				if err != nil {
-					log.Printf("kompose: warning: cannot access metadata of object: %v", err)
-					continue
-				}
-				if accessor.GetKind() == "Namespace" {
-					continue
-				}
-
 				if err := s.Encode(obj.(runtime.Object), &buf); err != nil {
 					panic(err)
 				}
@@ -602,46 +641,6 @@ func (kmp *Kompose) provision(ctx *pulumi.Context, in KomposeArgsOutput, opts ..
 			}
 
 			man = buf.String()
-
-			// Below is an alternative method where we inject the namespace on the objects
-			// If this method is used, then you don't want to pass the namespace to Kompose directly
-
-			//  _, objs, err := kompose(yaml)
-			//  if err != nil {
-			//  	panic(err)
-			//  }
-			//
-			//  // Inject namespace directly into Kompose objects
-			//  for _, obj := range objs {
-			//  	acc, err := meta.Accessor(obj)
-			//  	if err != nil {
-			//  		continue
-			//  	}
-			//  	// Skip cluster-scoped resources
-			//  	if acc.GetNamespace() == "" {
-			//  		in.Identity().ApplyT(func(ns string) error {
-			//  			acc.SetNamespace(ns)
-			//  			return nil
-			//  		})
-			//  	}
-			//  }
-			//
-			//  // Re-serialize objects to YAML
-			//  s := json.NewYAMLSerializer(
-			//  	json.DefaultMetaFactory,
-			//  	nil,
-			//  	nil,
-			//  )
-			//
-			//  var buf bytes.Buffer
-			//  for _, obj := range objs {
-			//  	if err := s.Encode(obj.(runtime.Object), &buf); err != nil {
-			//  		panic(err)
-			//  	}
-			//  	buf.WriteString("\n---\n")
-			//  }
-			//
-			//  man = buf.String()
 
 			objwg.Done()
 			return man
@@ -1072,12 +1071,14 @@ func kompose(yaml string, namespace string) (string, []runtime.Object, error) {
 		InputFiles: []string{dc.Name()},
 		OutFile:    out.Name(),
 		// Default values in kompose CLI
-		Build:      "none",
-		Profiles:   []string{},
-		Volumes:    "persistentVolumeClaim",
-		Replicas:   1,
-		Provider:   "kubernetes",
-		Namespace:  namespace,
+		Build:    "none",
+		Profiles: []string{},
+		Volumes:  "persistentVolumeClaim",
+		Replicas: 1,
+		Provider: "kubernetes",
+		// this creates a namespaces and tags resources with the namespace
+		// we don't want the namespace to be created here
+		//Namespace:  namespace,
 		YAMLIndent: 2,
 	}
 	objs, err := app.Convert(opts)
