@@ -235,6 +235,7 @@ func (kmp *Kompose) provision(ctx *pulumi.Context, in KomposeArgsOutput, opts ..
 				"pod-security.kubernetes.io/warn":            pulumi.String("baseline"),
 				"pod-security.kubernetes.io/warn-version":    pulumi.String("latest"),
 			},
+			Annotations: in.NamespaceAnnotations(),
 		},
 	}, opts...)
 	if err != nil {
@@ -1135,6 +1136,8 @@ type KomposeArgsRaw struct {
 	IngressNamespace string            `pulumi:"ingressNamespace"`
 	IngressLabels    map[string]string `pulumi:"ingressLabels"`
 
+	NamespaceAnnotations map[string]string `pulumi:"namespaceAnnotations"`
+
 	// ImagePullSecretsNamespace is the namespace from which to copy image pull secrets.
 	// If not specified, defaults to "default".
 	ImagePullSecretsNamespace string `pulumi:"imagePullSecretsNamespace"`
@@ -1166,6 +1169,8 @@ type KomposeArgs struct {
 	FromCIDR         pulumi.StringInput    `pulumi:"fromCIDR"`
 	IngressNamespace pulumi.StringInput    `pulumi:"ingressNamespace"`
 	IngressLabels    pulumi.StringMapInput `pulumi:"ingressLabels"`
+
+	NamespaceAnnotations pulumi.StringMapInput `pulumi:"namespaceAnnotations"`
 
 	// ImagePullSecretsNamespace is the namespace from which to copy image pull secrets.
 	// If not specified, defaults to "default".
@@ -1238,6 +1243,12 @@ func (o KomposeArgsOutput) IngressNamespace() pulumi.StringOutput {
 func (o KomposeArgsOutput) IngressLabels() pulumi.StringMapOutput {
 	return o.ApplyT(func(args KomposeArgsRaw) map[string]string {
 		return args.IngressLabels
+	}).(pulumi.StringMapOutput)
+}
+
+func (o KomposeArgsOutput) NamespaceAnnotations() pulumi.StringMapOutput {
+	return o.ApplyT(func(args KomposeArgsRaw) map[string]string {
+		return args.NamespaceAnnotations
 	}).(pulumi.StringMapOutput)
 }
 
