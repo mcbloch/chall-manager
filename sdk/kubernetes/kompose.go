@@ -1,11 +1,14 @@
 package kubernetes
 
 import (
-	// "bytes"
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"k8s.io/apimachinery/pkg/api/meta"
+
 	//"k8s.io/apimachinery/pkg/api/meta"
 	//"k8s.io/apimachinery/pkg/runtime/serializer/json"
 	"log"
@@ -564,7 +567,44 @@ func (kmp *Kompose) provision(ctx *pulumi.Context, in KomposeArgsOutput, opts ..
 	kmp.cg, err = yamlv2.NewConfigGroup(ctx, "kompose", &yamlv2.ConfigGroupArgs{
 		Yaml: in.ApplyT(func(in KomposeArgsRaw) (man string) {
 			//man, _, _ = kompose(in.YAML, in.Identity)
-			man, _, _ = kompose(in.YAML, in.Identity)
+			man, ojbs, err = kompose(in.YAML, in.Identity)
+			if err != nil {
+				panic(err)
+			}
+
+			// An alternative would be to pass namespace to Kompose directly,
+			// but then it will also create the namespace which we don't want
+			// so then you should remove this afterwards.
+
+			// Re-serialize objects to YAML
+			s := json.NewYAMLSerializer(
+				json.DefaultMetaFactory,
+				nil,
+				nil,
+			)
+
+			var buf bytes.Buffer
+			for _, obj := range objs {
+				// Check if obj is a namespace, if so, remove it
+				accessor, err := meta.Accessor(obj)
+				if err != nil {
+					log.Printf("kompose: warning: cannot access metadata of object: %v", err)
+					continue
+				}
+				if accessor.GetKind() == "Namespace" {
+					continue
+				}
+
+				if err := s.Encode(obj.(runtime.Object), &buf); err != nil {
+					panic(err)
+				}
+				buf.WriteString("\n---\n")
+			}
+
+			man = buf.String()
+
+			// Below is an alternative method where we inject the namespace on the objects
+			// If this method is used, then you don't want to pass the namespace to Kompose directly
 
 			//  _, objs, err := kompose(yaml)
 			//  if err != nil {
