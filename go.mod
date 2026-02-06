@@ -4,7 +4,6 @@ go 1.25.4
 
 require (
 	github.com/bufbuild/buf v1.64.0
-	github.com/ctfer-io/chall-manager v0.0.0-00010101000000-000000000000
 	github.com/distribution/reference v0.6.0
 	github.com/goccy/go-json v0.10.5
 	github.com/google/go-containerregistry v0.20.7
