@@ -208,4 +208,4 @@ require (
 	pluginrpc.com/pluginrpc v0.5.0 // indirect
 )
 
-replace github.com/ctfer-io/chall-manager => github.com/mcbloch/chall-manager v0.0.0-20251209230134-7dbd71c039cb
+replace github.com/ctfer-io/chall-manager => github.com/mcbloch/chall-manager v0.0.0-20260206134828-92d310e952e8
