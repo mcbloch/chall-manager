@@ -33,6 +33,17 @@ services:
       MONGO_INITDB_ROOT_PASSWORD: 5e409bd6c906e75bc961de62d516ca52
 `
 
+const dcWithImagePullSecret = `
+services:
+  web:
+    privileged: false
+    image: myregistry.io/myapp:latest
+    labels:
+      kompose.image-pull-secret: my-registry-secret
+    ports:
+      - "8080:8080"
+`
+
 func Test_U_Kompose(t *testing.T) {
 	t.Parallel()
 
@@ -99,6 +110,23 @@ func Test_U_Kompose(t *testing.T) {
 						k8s.PortBindingArgs{
 							Port:       pulumi.Int(3000),
 							ExposeType: k8s.ExposeLoadBalancer,
+						},
+					},
+				},
+			},
+			ExpectErr: false,
+		},
+		"with-image-pull-secret": {
+			Args: &k8s.KomposeArgs{
+				Identity:                  pulumi.String("a0b1c2d3"),
+				Hostname:                  pulumi.String("24hiut25.ctfer.io"),
+				YAML:                      pulumi.String(dcWithImagePullSecret),
+				ImagePullSecretsNamespace: pulumi.String("default"),
+				Ports: k8s.PortBindingMapArray{
+					"web": {
+						k8s.PortBindingArgs{
+							Port:       pulumi.Int(8080),
+							ExposeType: k8s.ExposeNodePort,
 						},
 					},
 				},
