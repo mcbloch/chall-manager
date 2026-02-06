@@ -1,10 +1,14 @@
 package kubernetes
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"io"
+	"k8s.io/apimachinery/pkg/api/meta"
+	"k8s.io/apimachinery/pkg/runtime/serializer/json"
+
 	"log"
 	"maps"
 	"os"
@@ -129,7 +133,7 @@ func (kmp *Kompose) check(in KomposeArgsOutput) (merr error) {
 		}
 
 		// Ensure docker compose can be transformd to YAML manifest
-		_, objs, err := kompose(in.YAML)
+		_, objs, err := kompose(in.YAML, in.Identity)
 		if err != nil {
 			cerr <- err
 			return nil
@@ -231,6 +235,7 @@ func (kmp *Kompose) provision(ctx *pulumi.Context, in KomposeArgsOutput, opts ..
 				"pod-security.kubernetes.io/warn":            pulumi.String("baseline"),
 				"pod-security.kubernetes.io/warn-version":    pulumi.String("latest"),
 			},
+			Annotations: in.NamespaceAnnotations(),
 		},
 	}, opts...)
 	if err != nil {
@@ -400,21 +405,21 @@ func (kmp *Kompose) provision(ctx *pulumi.Context, in KomposeArgsOutput, opts ..
 
 	// Transform resources to match expected configuration
 	opts = append(opts, pulumi.Transforms([]pulumi.ResourceTransform{
-		// Inject namespace
-		func(_ context.Context, args *pulumi.ResourceTransformArgs) *pulumi.ResourceTransformResult {
-			switch args.Type {
-			// Inject namespace on the fly
-			case "kubernetes:apps/v1:Deployment", "kubernetes:core/v1:Service":
-				args.Props["metadata"].(pulumi.Map)["namespace"] = in.Identity()
-				return &pulumi.ResourceTransformResult{
-					Props: args.Props,
-					Opts:  args.Opts,
-				}
-
-			default:
-				return nil
-			}
-		},
+		//// Inject namespace
+		//func(_ context.Context, args *pulumi.ResourceTransformArgs) *pulumi.ResourceTransformResult {
+		//	switch args.Type {
+		//	// Inject namespace on the fly; with the fix, applying the namespace to all created resources, further below, this is probably redundant
+		//	case "kubernetes:apps/v1:Deployment", "kubernetes:core/v1:Service":
+		//		args.Props["metadata"].(pulumi.Map)["namespace"] = in.Identity()
+		//		return &pulumi.ResourceTransformResult{
+		//			Props: args.Props,
+		//			Opts:  args.Opts,
+		//		}
+		//
+		//	default:
+		//		return nil
+		//	}
+		//},
 		// Make service NodePorts whenever required
 		func(_ context.Context, args *pulumi.ResourceTransformArgs) *pulumi.ResourceTransformResult {
 			if args.Type == "kubernetes:core/v1:Service" {
@@ -498,7 +503,7 @@ func (kmp *Kompose) provision(ctx *pulumi.Context, in KomposeArgsOutput, opts ..
 	var komposeErr error
 	in.ApplyT(func(args KomposeArgsRaw) error {
 		defer wg.Done()
-		_, objs, err := kompose(args.YAML)
+		_, objs, err := kompose(args.YAML, args.Identity)
 		if err != nil {
 			komposeErr = err
 			return err
@@ -559,8 +564,87 @@ func (kmp *Kompose) provision(ctx *pulumi.Context, in KomposeArgsOutput, opts ..
 	objwg := sync.WaitGroup{}
 	objwg.Add(1)
 	kmp.cg, err = yamlv2.NewConfigGroup(ctx, "kompose", &yamlv2.ConfigGroupArgs{
-		Yaml: in.YAML().ApplyT(func(yaml string) (man string) {
-			man, _, _ = kompose(yaml)
+		Yaml: in.ApplyT(func(in KomposeArgsRaw) (man string) {
+			//man, _, _ = kompose(in.YAML, in.Identity)
+
+			// An alternative is to pass namespace to Kompose directly,
+			// then kompose is also creating a namespace which we need to remove
+			//
+			// man, ojbs, err = kompose(in.YAML, in.Identity)
+			//	if err != nil {
+			//		panic(err)
+			//	}
+			//
+			//// Re-serialize objects to YAML
+			//s := json.NewYAMLSerializer(
+			//	json.DefaultMetaFactory,
+			//	nil,
+			//	nil,
+			//)
+			//
+			//var buf bytes.Buffer
+			//for _, obj := range objs {
+			//	// Check if obj is a namespace, if so, remove it
+			//	accessor, err := meta.Accessor(obj)
+			//	if err != nil {
+			//		log.Printf("kompose: warning: cannot access metadata of object: %v", err)
+			//		continue
+			//	}
+			//  // GetKind is not a valid method of the accessor, need to use TypeMeta
+			//  // But I don't know how to at the moment
+			//	if accessor.GetKind() == "Namespace" {
+			//		continue
+			//	}
+			//
+			//	if err := s.Encode(obj.(runtime.Object), &buf); err != nil {
+			//		panic(err)
+			//	}
+			//	buf.WriteString("\n---\n")
+			//}
+			//
+			//man = buf.String()
+
+			// Below is an alternative method where we inject the namespace on the objects
+			// If this method is used, then you don't want to pass the namespace to Kompose directly
+
+			_, objs, err := kompose(in.YAML, in.Identity)
+			if err != nil {
+				panic(err)
+			}
+
+			// Inject namespace directly into Kompose objects
+			for _, obj := range objs {
+				acc, err := meta.Accessor(obj)
+				if err != nil {
+					continue
+				}
+				// Skip cluster-scoped resources
+				if acc.GetNamespace() == "" {
+					acc.SetNamespace(in.Identity)
+					//in.Identity.ApplyT(func(ns string) error {
+					//	acc.SetNamespace(ns)
+					//	return nil
+					//})
+				}
+			}
+
+			// Re-serialize objects to YAML
+			s := json.NewYAMLSerializer(
+				json.DefaultMetaFactory,
+				nil,
+				nil,
+			)
+
+			var buf bytes.Buffer
+			for _, obj := range objs {
+				if err := s.Encode(obj.(runtime.Object), &buf); err != nil {
+					panic(err)
+				}
+				buf.WriteString("\n---\n")
+			}
+
+			man = buf.String()
+
 			objwg.Done()
 			return man
 		}).(pulumi.StringOutput),
@@ -762,7 +846,7 @@ func (kmp *Kompose) provision(ctx *pulumi.Context, in KomposeArgsOutput, opts ..
 										p.Protocol = "TCP"
 									}
 
-									// Generate a hash of the seed, keep only first bytes (same lenght as
+									// Generate a hash of the seed, keep only first bytes (same length as
 									// identity to avoid fingerprinting scenario on ingress name).
 									seed := fmt.Sprintf("%s-%s-%d/%s", id, name, p.Port, p.Protocol)
 									return randName(seed)[:len(id)]
@@ -964,7 +1048,7 @@ func (kmp *Kompose) outputs(ctx *pulumi.Context, in KomposeArgsOutput) error {
 	})
 }
 
-func kompose(yaml string) (string, []runtime.Object, error) {
+func kompose(yaml string, namespace string) (string, []runtime.Object, error) {
 	// XXX creating files is error-prone, but a good balance between no kompose SDK and incorporating kompose in CM install
 	// Create temporary input file and output
 	dc, err := os.CreateTemp(kdir, "dc")
@@ -985,15 +1069,19 @@ func kompose(yaml string) (string, []runtime.Object, error) {
 	}()
 
 	// Run kompose
+	// Checkout possible options here: https://github.com/kubernetes/kompose/blob/main/pkg/kobject/kobject.go
 	opts := kobject.ConvertOptions{
 		InputFiles: []string{dc.Name()},
 		OutFile:    out.Name(),
 		// Default values in kompose CLI
-		Build:      "none",
-		Profiles:   []string{},
-		Volumes:    "persistentVolumeClaim",
-		Replicas:   1,
-		Provider:   "kubernetes",
+		Build:    "none",
+		Profiles: []string{},
+		Volumes:  "persistentVolumeClaim",
+		Replicas: 1,
+		Provider: "kubernetes",
+		// this creates a namespaces and tags resources with the namespace
+		// we don't want the namespace to be created here
+		//Namespace:  namespace,
 		YAMLIndent: 2,
 	}
 	objs, err := app.Convert(opts)
@@ -1048,6 +1136,8 @@ type KomposeArgsRaw struct {
 	IngressNamespace string            `pulumi:"ingressNamespace"`
 	IngressLabels    map[string]string `pulumi:"ingressLabels"`
 
+	NamespaceAnnotations map[string]string `pulumi:"namespaceAnnotations"`
+
 	// ImagePullSecretsNamespace is the namespace from which to copy image pull secrets.
 	// If not specified, defaults to "default".
 	ImagePullSecretsNamespace string `pulumi:"imagePullSecretsNamespace"`
@@ -1079,6 +1169,8 @@ type KomposeArgs struct {
 	FromCIDR         pulumi.StringInput    `pulumi:"fromCIDR"`
 	IngressNamespace pulumi.StringInput    `pulumi:"ingressNamespace"`
 	IngressLabels    pulumi.StringMapInput `pulumi:"ingressLabels"`
+
+	NamespaceAnnotations pulumi.StringMapInput `pulumi:"namespaceAnnotations"`
 
 	// ImagePullSecretsNamespace is the namespace from which to copy image pull secrets.
 	// If not specified, defaults to "default".
@@ -1151,6 +1243,12 @@ func (o KomposeArgsOutput) IngressNamespace() pulumi.StringOutput {
 func (o KomposeArgsOutput) IngressLabels() pulumi.StringMapOutput {
 	return o.ApplyT(func(args KomposeArgsRaw) map[string]string {
 		return args.IngressLabels
+	}).(pulumi.StringMapOutput)
+}
+
+func (o KomposeArgsOutput) NamespaceAnnotations() pulumi.StringMapOutput {
+	return o.ApplyT(func(args KomposeArgsRaw) map[string]string {
+		return args.NamespaceAnnotations
 	}).(pulumi.StringMapOutput)
 }
 
