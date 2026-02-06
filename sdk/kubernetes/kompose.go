@@ -846,7 +846,7 @@ func (kmp *Kompose) provision(ctx *pulumi.Context, in KomposeArgsOutput, opts ..
 										p.Protocol = "TCP"
 									}
 
-									// Generate a hash of the seed, keep only first bytes (same lenght as
+									// Generate a hash of the seed, keep only first bytes (same length as
 									// identity to avoid fingerprinting scenario on ingress name).
 									seed := fmt.Sprintf("%s-%s-%d/%s", id, name, p.Port, p.Protocol)
 									return randName(seed)[:len(id)]
