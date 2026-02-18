@@ -1,10 +1,14 @@
 package kubernetes
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"io"
+	"k8s.io/apimachinery/pkg/api/meta"
+	"k8s.io/apimachinery/pkg/runtime/serializer/json"
+
 	"log"
 	"maps"
 	"os"
@@ -22,6 +26,7 @@ import (
 	yamlv2 "github.com/pulumi/pulumi-kubernetes/sdk/v4/go/kubernetes/yaml/v2"
 	"github.com/pulumi/pulumi/sdk/v3/go/pulumi"
 	"go.uber.org/multierr"
+	appsv1 "k8s.io/api/apps/v1"
 	cv1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 )
@@ -37,11 +42,13 @@ func init() {
 type Kompose struct {
 	pulumi.ResourceState
 
-	ns          *corev1.Namespace
-	innspol     *netwv1.NetworkPolicy
-	dnspol      *netwv1.NetworkPolicy
-	internspol  *netwv1.NetworkPolicy
-	internetpol *netwv1.NetworkPolicy
+	ns                      *corev1.Namespace
+	denyAllPol              *netwv1.NetworkPolicy
+	dnsUdpPol               *netwv1.NetworkPolicy
+	dnsTcpPol               *netwv1.NetworkPolicy
+	internetPol             *netwv1.NetworkPolicy
+	sameNamespaceIngressPol *netwv1.NetworkPolicy
+	sameNamespaceEgressPol  *netwv1.NetworkPolicy
 
 	cg       *yamlv2.ConfigGroup
 	svcs     ServiceMapMapOutput
@@ -128,7 +135,7 @@ func (kmp *Kompose) check(in KomposeArgsOutput) (merr error) {
 		}
 
 		// Ensure docker compose can be transformd to YAML manifest
-		_, objs, err := kompose(in.YAML)
+		_, objs, err := kompose(in.YAML, in.Identity)
 		if err != nil {
 			cerr <- err
 			return nil
@@ -230,14 +237,32 @@ func (kmp *Kompose) provision(ctx *pulumi.Context, in KomposeArgsOutput, opts ..
 				"pod-security.kubernetes.io/warn":            pulumi.String("baseline"),
 				"pod-security.kubernetes.io/warn-version":    pulumi.String("latest"),
 			},
+			Annotations: in.NamespaceAnnotations(),
 		},
 	}, opts...)
 	if err != nil {
 		return
 	}
 
-	// => NetworkPolicy to grant all network interactions within the namespace
-	kmp.innspol, err = netwv1.NewNetworkPolicy(ctx, "allow-all-within-namespace", &netwv1.NetworkPolicyArgs{
+	// => NetworkPolicy baseline: deny all ingress and egress traffic
+	kmp.denyAllPol, err = netwv1.NewNetworkPolicy(ctx, "deny-all", &netwv1.NetworkPolicyArgs{
+		Metadata: metav1.ObjectMetaArgs{
+			Namespace: kmp.ns.Metadata.Name().Elem(),
+		},
+		Spec: netwv1.NetworkPolicySpecArgs{
+			PodSelector: metav1.LabelSelectorArgs{}, // Selects all Pods in the namespace
+			PolicyTypes: pulumi.ToStringArray([]string{
+				"Ingress",
+				"Egress",
+			}),
+		},
+	}, opts...)
+	if err != nil {
+		return
+	}
+
+	// => NetworkPolicy to allow communication within the same namespace (ingress)
+	kmp.sameNamespaceIngressPol, err = netwv1.NewNetworkPolicy(ctx, "allow-same-namespace-ingress", &netwv1.NetworkPolicyArgs{
 		Metadata: metav1.ObjectMetaArgs{
 			Namespace: kmp.ns.Metadata.Name().Elem(),
 		},
@@ -252,6 +277,22 @@ func (kmp *Kompose) provision(ctx *pulumi.Context, in KomposeArgsOutput, opts ..
 					},
 				},
 			},
+			PolicyTypes: pulumi.ToStringArray([]string{
+				"Ingress",
+			}),
+		},
+	}, opts...)
+	if err != nil {
+		return
+	}
+
+	// => NetworkPolicy to allow communication within the same namespace (egress)
+	kmp.sameNamespaceEgressPol, err = netwv1.NewNetworkPolicy(ctx, "allow-same-namespace-egress", &netwv1.NetworkPolicyArgs{
+		Metadata: metav1.ObjectMetaArgs{
+			Namespace: kmp.ns.Metadata.Name().Elem(),
+		},
+		Spec: netwv1.NetworkPolicySpecArgs{
+			PodSelector: metav1.LabelSelectorArgs{}, // Selects all Pods in the namespace
 			Egress: netwv1.NetworkPolicyEgressRuleArray{
 				netwv1.NetworkPolicyEgressRuleArgs{
 					To: netwv1.NetworkPolicyPeerArray{
@@ -262,7 +303,6 @@ func (kmp *Kompose) provision(ctx *pulumi.Context, in KomposeArgsOutput, opts ..
 				},
 			},
 			PolicyTypes: pulumi.ToStringArray([]string{
-				"Ingress",
 				"Egress",
 			}),
 		},
@@ -271,23 +311,16 @@ func (kmp *Kompose) provision(ctx *pulumi.Context, in KomposeArgsOutput, opts ..
 		return
 	}
 
-	// => NetworkPolicy to grant DNS resolution (complex scenarios could require
-	// to reach other pods in the namespace, e.g. not a scenario that fits into
-	// the sdk.ctfer.io/ExposedMonopod architecture, which then would use headless
-	// services so DNS resolution).
-	kmp.dnspol, err = netwv1.NewNetworkPolicy(ctx, "allow-kube-dns", &netwv1.NetworkPolicyArgs{
+	// => NetworkPolicy to grant DNS resolution via UDP to cluster DNS
+	kmp.dnsUdpPol, err = netwv1.NewNetworkPolicy(ctx, "allow-dns-udp", &netwv1.NetworkPolicyArgs{
 		Metadata: metav1.ObjectMetaArgs{
 			Namespace: kmp.ns.Metadata.Name(),
-			Labels: pulumi.StringMap{
-				"app.kubernetes.io/component": pulumi.String("chall-manager"),
-				"app.kubernetes.io/part-of":   pulumi.String("chall-manager"),
-			},
 		},
 		Spec: netwv1.NetworkPolicySpecArgs{
+			PodSelector: metav1.LabelSelectorArgs{},
 			PolicyTypes: pulumi.ToStringArray([]string{
 				"Egress",
 			}),
-			PodSelector: metav1.LabelSelectorArgs{},
 			Egress: netwv1.NetworkPolicyEgressRuleArray{
 				netwv1.NetworkPolicyEgressRuleArgs{
 					To: netwv1.NetworkPolicyPeerArray{
@@ -297,11 +330,6 @@ func (kmp *Kompose) provision(ctx *pulumi.Context, in KomposeArgsOutput, opts ..
 									"kubernetes.io/metadata.name": pulumi.String("kube-system"),
 								},
 							},
-							PodSelector: metav1.LabelSelectorArgs{
-								MatchLabels: pulumi.StringMap{
-									"k8s-app": pulumi.String("kube-dns"),
-								},
-							},
 						},
 					},
 					Ports: netwv1.NetworkPolicyPortArray{
@@ -309,6 +337,37 @@ func (kmp *Kompose) provision(ctx *pulumi.Context, in KomposeArgsOutput, opts ..
 							Port:     pulumi.Int(53),
 							Protocol: pulumi.String("UDP"),
 						},
+					},
+				},
+			},
+		},
+	}, opts...)
+	if err != nil {
+		return
+	}
+
+	// => NetworkPolicy to grant DNS resolution via TCP to cluster DNS
+	kmp.dnsTcpPol, err = netwv1.NewNetworkPolicy(ctx, "allow-dns-tcp", &netwv1.NetworkPolicyArgs{
+		Metadata: metav1.ObjectMetaArgs{
+			Namespace: kmp.ns.Metadata.Name(),
+		},
+		Spec: netwv1.NetworkPolicySpecArgs{
+			PodSelector: metav1.LabelSelectorArgs{},
+			PolicyTypes: pulumi.ToStringArray([]string{
+				"Egress",
+			}),
+			Egress: netwv1.NetworkPolicyEgressRuleArray{
+				netwv1.NetworkPolicyEgressRuleArgs{
+					To: netwv1.NetworkPolicyPeerArray{
+						netwv1.NetworkPolicyPeerArgs{
+							NamespaceSelector: metav1.LabelSelectorArgs{
+								MatchLabels: pulumi.StringMap{
+									"kubernetes.io/metadata.name": pulumi.String("kube-system"),
+								},
+							},
+						},
+					},
+					Ports: netwv1.NetworkPolicyPortArray{
 						netwv1.NetworkPolicyPortArgs{
 							Port:     pulumi.Int(53),
 							Protocol: pulumi.String("TCP"),
@@ -322,53 +381,10 @@ func (kmp *Kompose) provision(ctx *pulumi.Context, in KomposeArgsOutput, opts ..
 		return
 	}
 
-	// => NetworkPolicy to deny all scenarios from reaching adjacent namespaces
-	kmp.internspol, err = netwv1.NewNetworkPolicy(ctx, "deny-inter-ns", &netwv1.NetworkPolicyArgs{
+	// => NetworkPolicy to allow all internet egress (all ports and protocols)
+	kmp.internetPol, err = netwv1.NewNetworkPolicy(ctx, "allow-internet-all", &netwv1.NetworkPolicyArgs{
 		Metadata: metav1.ObjectMetaArgs{
 			Namespace: kmp.ns.Metadata.Name(),
-			Labels: pulumi.StringMap{
-				"app.kubernetes.io/component": pulumi.String("chall-manager"),
-				"app.kubernetes.io/part-of":   pulumi.String("chall-manager"),
-			},
-		},
-		Spec: netwv1.NetworkPolicySpecArgs{
-			PodSelector: metav1.LabelSelectorArgs{},
-			PolicyTypes: pulumi.ToStringArray([]string{
-				"Egress",
-			}),
-			Egress: netwv1.NetworkPolicyEgressRuleArray{
-				netwv1.NetworkPolicyEgressRuleArgs{
-					To: netwv1.NetworkPolicyPeerArray{
-						netwv1.NetworkPolicyPeerArgs{
-							NamespaceSelector: metav1.LabelSelectorArgs{
-								MatchExpressions: metav1.LabelSelectorRequirementArray{
-									metav1.LabelSelectorRequirementArgs{
-										Key:      pulumi.String("kubernetes.io/metadata.name"),
-										Operator: pulumi.String("NotIn"),
-										Values: pulumi.StringArray{
-											kmp.ns.Metadata.Name().Elem(),
-										},
-									},
-								},
-							},
-						},
-					},
-				},
-			},
-		},
-	}, opts...)
-	if err != nil {
-		return
-	}
-
-	// => NetworkPolicy to grant access to Internet IPs (required to download fonts, images, etc.)
-	kmp.internetpol, err = netwv1.NewNetworkPolicy(ctx, "allow-internet", &netwv1.NetworkPolicyArgs{
-		Metadata: metav1.ObjectMetaArgs{
-			Namespace: kmp.ns.Metadata.Name(),
-			Labels: pulumi.StringMap{
-				"app.kubernetes.io/component": pulumi.String("chall-manager"),
-				"app.kubernetes.io/part-of":   pulumi.String("chall-manager"),
-			},
 		},
 		Spec: netwv1.NetworkPolicySpecArgs{
 			PodSelector: metav1.LabelSelectorArgs{},
@@ -385,6 +401,7 @@ func (kmp *Kompose) provision(ctx *pulumi.Context, in KomposeArgsOutput, opts ..
 									"10.0.0.0/8",     // internal Kubernetes cluster IP range
 									"172.16.0.0/12",  // common internal IP range
 									"192.168.0.0/16", // common internal IP range
+									"198.18.0.0/15",  // private benchmark testing range
 								}),
 							},
 						},
@@ -399,21 +416,21 @@ func (kmp *Kompose) provision(ctx *pulumi.Context, in KomposeArgsOutput, opts ..
 
 	// Transform resources to match expected configuration
 	opts = append(opts, pulumi.Transforms([]pulumi.ResourceTransform{
-		// Inject namespace
-		func(_ context.Context, args *pulumi.ResourceTransformArgs) *pulumi.ResourceTransformResult {
-			switch args.Type {
-			// Inject namespace on the fly
-			case "kubernetes:apps/v1:Deployment", "kubernetes:core/v1:Service":
-				args.Props["metadata"].(pulumi.Map)["namespace"] = in.Identity()
-				return &pulumi.ResourceTransformResult{
-					Props: args.Props,
-					Opts:  args.Opts,
-				}
-
-			default:
-				return nil
-			}
-		},
+		//// Inject namespace
+		//func(_ context.Context, args *pulumi.ResourceTransformArgs) *pulumi.ResourceTransformResult {
+		//	switch args.Type {
+		//	// Inject namespace on the fly; with the fix, applying the namespace to all created resources, further below, this is probably redundant
+		//	case "kubernetes:apps/v1:Deployment", "kubernetes:core/v1:Service":
+		//		args.Props["metadata"].(pulumi.Map)["namespace"] = in.Identity()
+		//		return &pulumi.ResourceTransformResult{
+		//			Props: args.Props,
+		//			Opts:  args.Opts,
+		//		}
+		//
+		//	default:
+		//		return nil
+		//	}
+		//},
 		// Make service NodePorts whenever required
 		func(_ context.Context, args *pulumi.ResourceTransformArgs) *pulumi.ResourceTransformResult {
 			if args.Type == "kubernetes:core/v1:Service" {
@@ -488,12 +505,157 @@ func (kmp *Kompose) provision(ctx *pulumi.Context, in KomposeArgsOutput, opts ..
 		},
 	}))
 
+	// Copy image pull secrets from the source namespace to the challenge namespace
+	// Extract secret names from the YAML by running kompose conversion synchronously
+	var secretNames []string
+	// We need to extract the secret names synchronously from the in parameter
+	wg := sync.WaitGroup{}
+	wg.Add(1)
+	var komposeErr error
+	in.ApplyT(func(args KomposeArgsRaw) error {
+		defer wg.Done()
+		_, objs, err := kompose(args.YAML, args.Identity)
+		if err != nil {
+			komposeErr = err
+			return err
+		}
+		secretNames = extractImagePullSecrets(objs)
+		return nil
+	})
+	wg.Wait()
+
+	if komposeErr != nil {
+		return komposeErr
+	}
+
+	// Copy each secret from the source namespace to the target namespace
+	// We use GetSecret to read the existing secret and then create a copy in the new namespace
+	for _, secretName := range secretNames {
+		secretNameLocal := secretName // capture loop variable
+
+		// Build the source secret ID as namespace/name with safe type handling
+		sourceSecretID := pulumi.All(in.ImagePullSecretsNamespace(), pulumi.String(secretNameLocal)).ApplyT(func(args []interface{}) (pulumi.ID, error) {
+			if len(args) != 2 {
+				return "", fmt.Errorf("expected 2 arguments, got %d", len(args))
+			}
+			namespace, ok := args[0].(string)
+			if !ok {
+				return "", fmt.Errorf("expected namespace to be string, got %T", args[0])
+			}
+			name, ok := args[1].(string)
+			if !ok {
+				return "", fmt.Errorf("expected secret name to be string, got %T", args[1])
+			}
+			return pulumi.ID(fmt.Sprintf("%s/%s", namespace, name)), nil
+		}).(pulumi.IDOutput)
+
+		// Get the secret from the source namespace using GetSecret
+		sourceSecret, serr := corev1.GetSecret(ctx, fmt.Sprintf("source-secret-%s", secretNameLocal), sourceSecretID, nil, opts...)
+		if serr != nil {
+			// If the secret doesn't exist, skip copying it.
+			// The Kubernetes deployment will fail with a clear error if the secret is actually needed.
+			continue
+		}
+
+		// Create a copy of the secret in the target namespace
+		_, err = corev1.NewSecret(ctx, fmt.Sprintf("secret-%s", secretNameLocal), &corev1.SecretArgs{
+			Metadata: metav1.ObjectMetaArgs{
+				Name:      pulumi.String(secretNameLocal),
+				Namespace: kmp.ns.Metadata.Name().Elem(),
+			},
+			Data: sourceSecret.Data,
+			Type: sourceSecret.Type,
+		}, opts...)
+		if err != nil {
+			return
+		}
+	}
+
 	// Generate Kubernetes resources
 	objwg := sync.WaitGroup{}
 	objwg.Add(1)
 	kmp.cg, err = yamlv2.NewConfigGroup(ctx, "kompose", &yamlv2.ConfigGroupArgs{
-		Yaml: in.YAML().ApplyT(func(yaml string) (man string) {
-			man, _, _ = kompose(yaml)
+		Yaml: in.ApplyT(func(in KomposeArgsRaw) (man string) {
+			//man, _, _ = kompose(in.YAML, in.Identity)
+
+			// An alternative is to pass namespace to Kompose directly,
+			// then kompose is also creating a namespace which we need to remove
+			//
+			// man, ojbs, err = kompose(in.YAML, in.Identity)
+			//	if err != nil {
+			//		panic(err)
+			//	}
+			//
+			//// Re-serialize objects to YAML
+			//s := json.NewYAMLSerializer(
+			//	json.DefaultMetaFactory,
+			//	nil,
+			//	nil,
+			//)
+			//
+			//var buf bytes.Buffer
+			//for _, obj := range objs {
+			//	// Check if obj is a namespace, if so, remove it
+			//	accessor, err := meta.Accessor(obj)
+			//	if err != nil {
+			//		log.Printf("kompose: warning: cannot access metadata of object: %v", err)
+			//		continue
+			//	}
+			//  // GetKind is not a valid method of the accessor, need to use TypeMeta
+			//  // But I don't know how to at the moment
+			//	if accessor.GetKind() == "Namespace" {
+			//		continue
+			//	}
+			//
+			//	if err := s.Encode(obj.(runtime.Object), &buf); err != nil {
+			//		panic(err)
+			//	}
+			//	buf.WriteString("\n---\n")
+			//}
+			//
+			//man = buf.String()
+
+			// Below is an alternative method where we inject the namespace on the objects
+			// If this method is used, then you don't want to pass the namespace to Kompose directly
+
+			_, objs, err := kompose(in.YAML, in.Identity)
+			if err != nil {
+				panic(err)
+			}
+
+			// Inject namespace directly into Kompose objects
+			for _, obj := range objs {
+				acc, err := meta.Accessor(obj)
+				if err != nil {
+					continue
+				}
+				// Skip cluster-scoped resources
+				if acc.GetNamespace() == "" {
+					acc.SetNamespace(in.Identity)
+					//in.Identity.ApplyT(func(ns string) error {
+					//	acc.SetNamespace(ns)
+					//	return nil
+					//})
+				}
+			}
+
+			// Re-serialize objects to YAML
+			s := json.NewYAMLSerializer(
+				json.DefaultMetaFactory,
+				nil,
+				nil,
+			)
+
+			var buf bytes.Buffer
+			for _, obj := range objs {
+				if err := s.Encode(obj.(runtime.Object), &buf); err != nil {
+					panic(err)
+				}
+				buf.WriteString("\n---\n")
+			}
+
+			man = buf.String()
+
 			objwg.Done()
 			return man
 		}).(pulumi.StringOutput),
@@ -695,7 +857,7 @@ func (kmp *Kompose) provision(ctx *pulumi.Context, in KomposeArgsOutput, opts ..
 										p.Protocol = "TCP"
 									}
 
-									// Generate a hash of the seed, keep only first bytes (same lenght as
+									// Generate a hash of the seed, keep only first bytes (same length as
 									// identity to avoid fingerprinting scenario on ingress name).
 									seed := fmt.Sprintf("%s-%s-%d/%s", id, name, p.Port, p.Protocol)
 									return randName(seed)[:len(id)]
@@ -897,7 +1059,7 @@ func (kmp *Kompose) outputs(ctx *pulumi.Context, in KomposeArgsOutput) error {
 	})
 }
 
-func kompose(yaml string) (string, []runtime.Object, error) {
+func kompose(yaml string, namespace string) (string, []runtime.Object, error) {
 	// XXX creating files is error-prone, but a good balance between no kompose SDK and incorporating kompose in CM install
 	// Create temporary input file and output
 	dc, err := os.CreateTemp(kdir, "dc")
@@ -918,15 +1080,19 @@ func kompose(yaml string) (string, []runtime.Object, error) {
 	}()
 
 	// Run kompose
+	// Checkout possible options here: https://github.com/kubernetes/kompose/blob/main/pkg/kobject/kobject.go
 	opts := kobject.ConvertOptions{
 		InputFiles: []string{dc.Name()},
 		OutFile:    out.Name(),
 		// Default values in kompose CLI
-		Build:      "none",
-		Profiles:   []string{},
-		Volumes:    "persistentVolumeClaim",
-		Replicas:   1,
-		Provider:   "kubernetes",
+		Build:    "none",
+		Profiles: []string{},
+		Volumes:  "persistentVolumeClaim",
+		Replicas: 1,
+		Provider: "kubernetes",
+		// this creates a namespaces and tags resources with the namespace
+		// we don't want the namespace to be created here
+		//Namespace:  namespace,
 		YAMLIndent: 2,
 	}
 	objs, err := app.Convert(opts)
@@ -939,6 +1105,32 @@ func kompose(yaml string) (string, []runtime.Object, error) {
 		return "", nil, err
 	}
 	return string(man), objs, nil
+}
+
+// extractImagePullSecrets extracts unique image pull secret names from Kubernetes Deployment objects.
+func extractImagePullSecrets(objs []runtime.Object) []string {
+	secretNames := map[string]struct{}{}
+
+	for _, obj := range objs {
+		// Check if the object is a Deployment
+		if dep, ok := obj.(*appsv1.Deployment); ok {
+			// Extract imagePullSecrets from the pod template spec
+			if dep.Spec.Template.Spec.ImagePullSecrets != nil {
+				for _, secret := range dep.Spec.Template.Spec.ImagePullSecrets {
+					if secret.Name != "" {
+						secretNames[secret.Name] = struct{}{}
+					}
+				}
+			}
+		}
+	}
+
+	// Convert map to slice
+	result := make([]string, 0, len(secretNames))
+	for name := range secretNames {
+		result = append(result, name)
+	}
+	return result
 }
 
 type KomposeArgsRaw struct {
@@ -954,6 +1146,12 @@ type KomposeArgsRaw struct {
 	FromCIDR         string            `pulumi:"fromCIDR"`
 	IngressNamespace string            `pulumi:"ingressNamespace"`
 	IngressLabels    map[string]string `pulumi:"ingressLabels"`
+
+	NamespaceAnnotations map[string]string `pulumi:"namespaceAnnotations"`
+
+	// ImagePullSecretsNamespace is the namespace from which to copy image pull secrets.
+	// If not specified, defaults to "default".
+	ImagePullSecretsNamespace string `pulumi:"imagePullSecretsNamespace"`
 }
 
 type KomposeArgsInput interface {
@@ -982,6 +1180,12 @@ type KomposeArgs struct {
 	FromCIDR         pulumi.StringInput    `pulumi:"fromCIDR"`
 	IngressNamespace pulumi.StringInput    `pulumi:"ingressNamespace"`
 	IngressLabels    pulumi.StringMapInput `pulumi:"ingressLabels"`
+
+	NamespaceAnnotations pulumi.StringMapInput `pulumi:"namespaceAnnotations"`
+
+	// ImagePullSecretsNamespace is the namespace from which to copy image pull secrets.
+	// If not specified, defaults to "default".
+	ImagePullSecretsNamespace pulumi.StringInput `pulumi:"imagePullSecretsNamespace"`
 }
 
 func (KomposeArgs) ElementType() reflect.Type {
@@ -1051,6 +1255,21 @@ func (o KomposeArgsOutput) IngressLabels() pulumi.StringMapOutput {
 	return o.ApplyT(func(args KomposeArgsRaw) map[string]string {
 		return args.IngressLabels
 	}).(pulumi.StringMapOutput)
+}
+
+func (o KomposeArgsOutput) NamespaceAnnotations() pulumi.StringMapOutput {
+	return o.ApplyT(func(args KomposeArgsRaw) map[string]string {
+		return args.NamespaceAnnotations
+	}).(pulumi.StringMapOutput)
+}
+
+func (o KomposeArgsOutput) ImagePullSecretsNamespace() pulumi.StringOutput {
+	return o.ApplyT(func(args KomposeArgsRaw) string {
+		if args.ImagePullSecretsNamespace == "" {
+			return "default"
+		}
+		return args.ImagePullSecretsNamespace
+	}).(pulumi.StringOutput)
 }
 
 func init() {
