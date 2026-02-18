@@ -42,11 +42,13 @@ func init() {
 type Kompose struct {
 	pulumi.ResourceState
 
-	ns          *corev1.Namespace
-	innspol     *netwv1.NetworkPolicy
-	dnspol      *netwv1.NetworkPolicy
-	internspol  *netwv1.NetworkPolicy
-	internetpol *netwv1.NetworkPolicy
+	ns                      *corev1.Namespace
+	denyAllPol              *netwv1.NetworkPolicy
+	dnsUdpPol               *netwv1.NetworkPolicy
+	dnsTcpPol               *netwv1.NetworkPolicy
+	internetPol             *netwv1.NetworkPolicy
+	sameNamespaceIngressPol *netwv1.NetworkPolicy
+	sameNamespaceEgressPol  *netwv1.NetworkPolicy
 
 	cg       *yamlv2.ConfigGroup
 	svcs     ServiceMapMapOutput
@@ -242,8 +244,25 @@ func (kmp *Kompose) provision(ctx *pulumi.Context, in KomposeArgsOutput, opts ..
 		return
 	}
 
-	// => NetworkPolicy to grant all network interactions within the namespace
-	kmp.innspol, err = netwv1.NewNetworkPolicy(ctx, "allow-all-within-namespace", &netwv1.NetworkPolicyArgs{
+	// => NetworkPolicy baseline: deny all ingress and egress traffic
+	kmp.denyAllPol, err = netwv1.NewNetworkPolicy(ctx, "deny-all", &netwv1.NetworkPolicyArgs{
+		Metadata: metav1.ObjectMetaArgs{
+			Namespace: kmp.ns.Metadata.Name().Elem(),
+		},
+		Spec: netwv1.NetworkPolicySpecArgs{
+			PodSelector: metav1.LabelSelectorArgs{}, // Selects all Pods in the namespace
+			PolicyTypes: pulumi.ToStringArray([]string{
+				"Ingress",
+				"Egress",
+			}),
+		},
+	}, opts...)
+	if err != nil {
+		return
+	}
+
+	// => NetworkPolicy to allow communication within the same namespace (ingress)
+	kmp.sameNamespaceIngressPol, err = netwv1.NewNetworkPolicy(ctx, "allow-same-namespace-ingress", &netwv1.NetworkPolicyArgs{
 		Metadata: metav1.ObjectMetaArgs{
 			Namespace: kmp.ns.Metadata.Name().Elem(),
 		},
@@ -258,6 +277,22 @@ func (kmp *Kompose) provision(ctx *pulumi.Context, in KomposeArgsOutput, opts ..
 					},
 				},
 			},
+			PolicyTypes: pulumi.ToStringArray([]string{
+				"Ingress",
+			}),
+		},
+	}, opts...)
+	if err != nil {
+		return
+	}
+
+	// => NetworkPolicy to allow communication within the same namespace (egress)
+	kmp.sameNamespaceEgressPol, err = netwv1.NewNetworkPolicy(ctx, "allow-same-namespace-egress", &netwv1.NetworkPolicyArgs{
+		Metadata: metav1.ObjectMetaArgs{
+			Namespace: kmp.ns.Metadata.Name().Elem(),
+		},
+		Spec: netwv1.NetworkPolicySpecArgs{
+			PodSelector: metav1.LabelSelectorArgs{}, // Selects all Pods in the namespace
 			Egress: netwv1.NetworkPolicyEgressRuleArray{
 				netwv1.NetworkPolicyEgressRuleArgs{
 					To: netwv1.NetworkPolicyPeerArray{
@@ -268,7 +303,6 @@ func (kmp *Kompose) provision(ctx *pulumi.Context, in KomposeArgsOutput, opts ..
 				},
 			},
 			PolicyTypes: pulumi.ToStringArray([]string{
-				"Ingress",
 				"Egress",
 			}),
 		},
@@ -277,23 +311,16 @@ func (kmp *Kompose) provision(ctx *pulumi.Context, in KomposeArgsOutput, opts ..
 		return
 	}
 
-	// => NetworkPolicy to grant DNS resolution (complex scenarios could require
-	// to reach other pods in the namespace, e.g. not a scenario that fits into
-	// the sdk.ctfer.io/ExposedMonopod architecture, which then would use headless
-	// services so DNS resolution).
-	kmp.dnspol, err = netwv1.NewNetworkPolicy(ctx, "allow-kube-dns", &netwv1.NetworkPolicyArgs{
+	// => NetworkPolicy to grant DNS resolution via UDP to cluster DNS
+	kmp.dnsUdpPol, err = netwv1.NewNetworkPolicy(ctx, "allow-dns-udp", &netwv1.NetworkPolicyArgs{
 		Metadata: metav1.ObjectMetaArgs{
 			Namespace: kmp.ns.Metadata.Name(),
-			Labels: pulumi.StringMap{
-				"app.kubernetes.io/component": pulumi.String("chall-manager"),
-				"app.kubernetes.io/part-of":   pulumi.String("chall-manager"),
-			},
 		},
 		Spec: netwv1.NetworkPolicySpecArgs{
+			PodSelector: metav1.LabelSelectorArgs{},
 			PolicyTypes: pulumi.ToStringArray([]string{
 				"Egress",
 			}),
-			PodSelector: metav1.LabelSelectorArgs{},
 			Egress: netwv1.NetworkPolicyEgressRuleArray{
 				netwv1.NetworkPolicyEgressRuleArgs{
 					To: netwv1.NetworkPolicyPeerArray{
@@ -303,11 +330,6 @@ func (kmp *Kompose) provision(ctx *pulumi.Context, in KomposeArgsOutput, opts ..
 									"kubernetes.io/metadata.name": pulumi.String("kube-system"),
 								},
 							},
-							PodSelector: metav1.LabelSelectorArgs{
-								MatchLabels: pulumi.StringMap{
-									"k8s-app": pulumi.String("kube-dns"),
-								},
-							},
 						},
 					},
 					Ports: netwv1.NetworkPolicyPortArray{
@@ -315,6 +337,37 @@ func (kmp *Kompose) provision(ctx *pulumi.Context, in KomposeArgsOutput, opts ..
 							Port:     pulumi.Int(53),
 							Protocol: pulumi.String("UDP"),
 						},
+					},
+				},
+			},
+		},
+	}, opts...)
+	if err != nil {
+		return
+	}
+
+	// => NetworkPolicy to grant DNS resolution via TCP to cluster DNS
+	kmp.dnsTcpPol, err = netwv1.NewNetworkPolicy(ctx, "allow-dns-tcp", &netwv1.NetworkPolicyArgs{
+		Metadata: metav1.ObjectMetaArgs{
+			Namespace: kmp.ns.Metadata.Name(),
+		},
+		Spec: netwv1.NetworkPolicySpecArgs{
+			PodSelector: metav1.LabelSelectorArgs{},
+			PolicyTypes: pulumi.ToStringArray([]string{
+				"Egress",
+			}),
+			Egress: netwv1.NetworkPolicyEgressRuleArray{
+				netwv1.NetworkPolicyEgressRuleArgs{
+					To: netwv1.NetworkPolicyPeerArray{
+						netwv1.NetworkPolicyPeerArgs{
+							NamespaceSelector: metav1.LabelSelectorArgs{
+								MatchLabels: pulumi.StringMap{
+									"kubernetes.io/metadata.name": pulumi.String("kube-system"),
+								},
+							},
+						},
+					},
+					Ports: netwv1.NetworkPolicyPortArray{
 						netwv1.NetworkPolicyPortArgs{
 							Port:     pulumi.Int(53),
 							Protocol: pulumi.String("TCP"),
@@ -328,53 +381,10 @@ func (kmp *Kompose) provision(ctx *pulumi.Context, in KomposeArgsOutput, opts ..
 		return
 	}
 
-	// => NetworkPolicy to deny all scenarios from reaching adjacent namespaces
-	kmp.internspol, err = netwv1.NewNetworkPolicy(ctx, "deny-inter-ns", &netwv1.NetworkPolicyArgs{
+	// => NetworkPolicy to allow all internet egress (all ports and protocols)
+	kmp.internetPol, err = netwv1.NewNetworkPolicy(ctx, "allow-internet-all", &netwv1.NetworkPolicyArgs{
 		Metadata: metav1.ObjectMetaArgs{
 			Namespace: kmp.ns.Metadata.Name(),
-			Labels: pulumi.StringMap{
-				"app.kubernetes.io/component": pulumi.String("chall-manager"),
-				"app.kubernetes.io/part-of":   pulumi.String("chall-manager"),
-			},
-		},
-		Spec: netwv1.NetworkPolicySpecArgs{
-			PodSelector: metav1.LabelSelectorArgs{},
-			PolicyTypes: pulumi.ToStringArray([]string{
-				"Egress",
-			}),
-			Egress: netwv1.NetworkPolicyEgressRuleArray{
-				netwv1.NetworkPolicyEgressRuleArgs{
-					To: netwv1.NetworkPolicyPeerArray{
-						netwv1.NetworkPolicyPeerArgs{
-							NamespaceSelector: metav1.LabelSelectorArgs{
-								MatchExpressions: metav1.LabelSelectorRequirementArray{
-									metav1.LabelSelectorRequirementArgs{
-										Key:      pulumi.String("kubernetes.io/metadata.name"),
-										Operator: pulumi.String("NotIn"),
-										Values: pulumi.StringArray{
-											kmp.ns.Metadata.Name().Elem(),
-										},
-									},
-								},
-							},
-						},
-					},
-				},
-			},
-		},
-	}, opts...)
-	if err != nil {
-		return
-	}
-
-	// => NetworkPolicy to grant access to Internet IPs (required to download fonts, images, etc.)
-	kmp.internetpol, err = netwv1.NewNetworkPolicy(ctx, "allow-internet", &netwv1.NetworkPolicyArgs{
-		Metadata: metav1.ObjectMetaArgs{
-			Namespace: kmp.ns.Metadata.Name(),
-			Labels: pulumi.StringMap{
-				"app.kubernetes.io/component": pulumi.String("chall-manager"),
-				"app.kubernetes.io/part-of":   pulumi.String("chall-manager"),
-			},
 		},
 		Spec: netwv1.NetworkPolicySpecArgs{
 			PodSelector: metav1.LabelSelectorArgs{},
@@ -391,6 +401,7 @@ func (kmp *Kompose) provision(ctx *pulumi.Context, in KomposeArgsOutput, opts ..
 									"10.0.0.0/8",     // internal Kubernetes cluster IP range
 									"172.16.0.0/12",  // common internal IP range
 									"192.168.0.0/16", // common internal IP range
+									"198.18.0.0/15",  // private benchmark testing range
 								}),
 							},
 						},
