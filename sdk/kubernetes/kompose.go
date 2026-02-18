@@ -244,7 +244,7 @@ func (kmp *Kompose) provision(ctx *pulumi.Context, in KomposeArgsOutput, opts ..
 		return
 	}
 
-	// => NetworkPolicy baseline: deny all ingress and egress traffic
+	// => NetworkPolicy baseline: deny all egress traffic by default (ingress is handled by explicit allow policies)
 	kmp.denyAllPol, err = netwv1.NewNetworkPolicy(ctx, "deny-all", &netwv1.NetworkPolicyArgs{
 		Metadata: metav1.ObjectMetaArgs{
 			Namespace: kmp.ns.Metadata.Name().Elem(),
@@ -252,7 +252,6 @@ func (kmp *Kompose) provision(ctx *pulumi.Context, in KomposeArgsOutput, opts ..
 		Spec: netwv1.NetworkPolicySpecArgs{
 			PodSelector: metav1.LabelSelectorArgs{}, // Selects all Pods in the namespace
 			PolicyTypes: pulumi.ToStringArray([]string{
-				"Ingress",
 				"Egress",
 			}),
 		},
@@ -261,7 +260,7 @@ func (kmp *Kompose) provision(ctx *pulumi.Context, in KomposeArgsOutput, opts ..
 		return
 	}
 
-	// => NetworkPolicy to allow communication within the same namespace (ingress)
+	// => NetworkPolicy to allow communication within the same namespace AND from external internet (ingress)
 	kmp.sameNamespaceIngressPol, err = netwv1.NewNetworkPolicy(ctx, "allow-same-namespace-ingress", &netwv1.NetworkPolicyArgs{
 		Metadata: metav1.ObjectMetaArgs{
 			Namespace: kmp.ns.Metadata.Name().Elem(),
@@ -269,12 +268,9 @@ func (kmp *Kompose) provision(ctx *pulumi.Context, in KomposeArgsOutput, opts ..
 		Spec: netwv1.NetworkPolicySpecArgs{
 			PodSelector: metav1.LabelSelectorArgs{}, // Selects all Pods in the namespace
 			Ingress: netwv1.NetworkPolicyIngressRuleArray{
+				// Allow all ingress (internal pods via podSelector AND external sources)
 				netwv1.NetworkPolicyIngressRuleArgs{
-					From: netwv1.NetworkPolicyPeerArray{
-						netwv1.NetworkPolicyPeerArgs{
-							PodSelector: metav1.LabelSelectorArgs{}, // Allows ingress from any Pod in the same namespace
-						},
-					},
+					From: netwv1.NetworkPolicyPeerArray{},
 				},
 			},
 			PolicyTypes: pulumi.ToStringArray([]string{
