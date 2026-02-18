@@ -145,5 +145,3 @@ require (
 	sigs.k8s.io/structured-merge-diff/v6 v6.3.0 // indirect
 	sigs.k8s.io/yaml v1.6.0 // indirect
 )
-
-replace github.com/ctfer-io/chall-manager/sdk => github.com/mcbloch/chall-manager/sdk v0.0.0-20260218003313-2e9720d24917

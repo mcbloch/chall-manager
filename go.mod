@@ -207,5 +207,3 @@ require (
 	nhooyr.io/websocket v1.8.6 // indirect
 	pluginrpc.com/pluginrpc v0.5.0 // indirect
 )
-
-replace github.com/ctfer-io/chall-manager => github.com/mcbloch/chall-manager v0.0.0-20260218003313-2e9720d24917
