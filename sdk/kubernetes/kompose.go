@@ -99,7 +99,7 @@ func NewKompose(ctx *pulumi.Context, name string, args *KomposeArgs, opts ...pul
 
 func (kmp *Kompose) check(in KomposeArgsOutput) (merr error) {
 	wg := sync.WaitGroup{}
-	checks := 5 // number of checks
+	checks := 4 // number of checks
 	wg.Add(checks)
 	cerr := make(chan error, checks)
 
@@ -177,16 +177,6 @@ func (kmp *Kompose) check(in KomposeArgsOutput) (merr error) {
 			}
 		}
 		cerr <- merr
-		return nil
-	})
-	// Ensure there is at least one port exposed
-	in.Ports().ApplyT(func(pbm map[string][]PortBinding) error {
-		defer wg.Done()
-
-		if len(pbm) == 0 {
-			cerr <- errors.New("no port bindings defined")
-			return nil
-		}
 		return nil
 	})
 	// Ensure there is no rule duplication
@@ -1228,7 +1218,36 @@ func (o KomposeArgsOutput) YAML() pulumi.StringOutput {
 
 func (o KomposeArgsOutput) Ports() PortBindingMapArrayOutput {
 	return o.ApplyT(func(k KomposeArgsRaw) map[string][]PortBinding {
-		return k.Ports
+		if len(k.Ports) > 0 {
+			return k.Ports
+		}
+		// Auto-derive ports from the docker-compose YAML: any service with
+		// port mappings becomes a NodePort binding.
+		_, objs, err := kompose(k.YAML, k.Identity)
+		if err != nil {
+			return k.Ports
+		}
+		derived := map[string][]PortBinding{}
+		for _, obj := range objs {
+			svc, ok := obj.(*cv1.Service)
+			if !ok || len(svc.Spec.Ports) == 0 {
+				continue
+			}
+			pbs := make([]PortBinding, 0, len(svc.Spec.Ports))
+			for _, p := range svc.Spec.Ports {
+				prot := string(p.Protocol)
+				if prot == "" {
+					prot = "TCP"
+				}
+				pbs = append(pbs, PortBinding{
+					Port:       int(p.Port),
+					Protocol:   prot,
+					ExposeType: ExposeNodePort,
+				})
+			}
+			derived[svc.Name] = pbs
+		}
+		return derived
 	}).(PortBindingMapArrayOutput)
 }
 
