@@ -729,6 +729,11 @@ func (kmp *Kompose) provision(ctx *pulumi.Context, in KomposeArgsOutput, opts ..
 							spec := all[1].(corev1.ServiceSpec)
 							pb := all[2].(PortBinding)
 
+							if len(spec.Ports) == 0 {
+								wg.Done()
+								return nil
+							}
+
 							svcProt := "TCP"
 							if spec.Ports[0].Protocol != nil {
 								svcProt = *spec.Ports[0].Protocol
