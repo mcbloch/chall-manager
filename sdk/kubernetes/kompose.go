@@ -28,6 +28,7 @@ import (
 	"go.uber.org/multierr"
 	appsv1 "k8s.io/api/apps/v1"
 	cv1 "k8s.io/api/core/v1"
+	k8smetav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 )
 
@@ -623,6 +624,41 @@ func (kmp *Kompose) provision(ctx *pulumi.Context, in KomposeArgsOutput, opts ..
 					//	return nil
 					//})
 				}
+			}
+
+			// Create headless services for deployments that don't already have
+			// a matching service, so containers can resolve each other by name
+			// within the namespace (e.g. http://app:8080).
+			depsByName := map[string]*appsv1.Deployment{}
+			svcNames := map[string]struct{}{}
+			for _, obj := range objs {
+				if dep, ok := obj.(*appsv1.Deployment); ok {
+					depsByName[dep.Name] = dep
+				}
+				if svc, ok := obj.(*cv1.Service); ok {
+					svcNames[svc.Name] = struct{}{}
+				}
+			}
+			for name, dep := range depsByName {
+				if _, hasSvc := svcNames[name]; hasSvc {
+					continue
+				}
+				headlessSvc := &cv1.Service{
+					TypeMeta: k8smetav1.TypeMeta{
+						Kind:       "Service",
+						APIVersion: "v1",
+					},
+					ObjectMeta: k8smetav1.ObjectMeta{
+						Name:      name,
+						Namespace: in.Identity,
+						Labels:    dep.Spec.Template.Labels,
+					},
+					Spec: cv1.ServiceSpec{
+						ClusterIP: cv1.ClusterIPNone,
+						Selector:  dep.Spec.Selector.MatchLabels,
+					},
+				}
+				objs = append(objs, headlessSvc)
 			}
 
 			// Re-serialize objects to YAML
