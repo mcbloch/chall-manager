@@ -235,7 +235,7 @@ func (kmp *Kompose) provision(ctx *pulumi.Context, in KomposeArgsOutput, opts ..
 		return
 	}
 
-	// => NetworkPolicy baseline: deny all egress traffic by default (ingress is handled by explicit allow policies)
+	// => NetworkPolicy baseline: deny all ingress and egress traffic by default
 	kmp.denyAllPol, err = netwv1.NewNetworkPolicy(ctx, "deny-all", &netwv1.NetworkPolicyArgs{
 		Metadata: metav1.ObjectMetaArgs{
 			Namespace: kmp.ns.Metadata.Name().Elem(),
@@ -243,6 +243,7 @@ func (kmp *Kompose) provision(ctx *pulumi.Context, in KomposeArgsOutput, opts ..
 		Spec: netwv1.NetworkPolicySpecArgs{
 			PodSelector: metav1.LabelSelectorArgs{}, // Selects all Pods in the namespace
 			PolicyTypes: pulumi.ToStringArray([]string{
+				"Ingress",
 				"Egress",
 			}),
 		},
@@ -251,7 +252,7 @@ func (kmp *Kompose) provision(ctx *pulumi.Context, in KomposeArgsOutput, opts ..
 		return
 	}
 
-	// => NetworkPolicy to allow communication within the same namespace AND from external internet (ingress)
+	// => NetworkPolicy to allow communication within the same namespace (ingress)
 	kmp.sameNamespaceIngressPol, err = netwv1.NewNetworkPolicy(ctx, "allow-same-namespace-ingress", &netwv1.NetworkPolicyArgs{
 		Metadata: metav1.ObjectMetaArgs{
 			Namespace: kmp.ns.Metadata.Name().Elem(),
@@ -259,9 +260,13 @@ func (kmp *Kompose) provision(ctx *pulumi.Context, in KomposeArgsOutput, opts ..
 		Spec: netwv1.NetworkPolicySpecArgs{
 			PodSelector: metav1.LabelSelectorArgs{}, // Selects all Pods in the namespace
 			Ingress: netwv1.NetworkPolicyIngressRuleArray{
-				// Allow all ingress (internal pods via podSelector AND external sources)
+				// Allow ingress from pods within the same namespace only
 				netwv1.NetworkPolicyIngressRuleArgs{
-					From: netwv1.NetworkPolicyPeerArray{},
+					From: netwv1.NetworkPolicyPeerArray{
+						netwv1.NetworkPolicyPeerArgs{
+							PodSelector: metav1.LabelSelectorArgs{}, // Empty selector matches all pods in the same namespace
+						},
+					},
 				},
 			},
 			PolicyTypes: pulumi.ToStringArray([]string{
